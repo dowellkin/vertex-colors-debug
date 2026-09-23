@@ -1,6 +1,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { Canvas, useThree } from '@react-three/fiber'
+import type { ThreeEvent } from '@react-three/fiber'
 import { OrbitControls, useGLTF } from '@react-three/drei'
 import * as THREE from 'three'
 import type { Mesh } from 'three'
@@ -13,6 +14,9 @@ type MaterialMode = 'basic' | 'standard'
 type ToneMappingMode = 'none' | 'aces' | 'agx'
 type BackgroundMode = 'black' | 'grey' | 'white'
 type VertexBlendMode = 'multiply' | 'add' | 'screen' | 'overlay' | 'mix'
+/** Как трактовать значения COLOR_n: linear — как есть (glTF-спека и Three.js), srgb — декодировать sRGB → linear. */
+type ColorDecodeMode = 'linear' | 'srgb'
+type ColorAttribute = THREE.BufferAttribute | THREE.InterleavedBufferAttribute
 
 const VERTEX_BLEND_MODE_ID: Record<VertexBlendMode, number> = {
 	multiply: 0,
@@ -21,6 +25,14 @@ const VERTEX_BLEND_MODE_ID: Record<VertexBlendMode, number> = {
 	overlay: 3,
 	mix: 4,
 }
+
+const COLOR_DECODE_ID: Record<ColorDecodeMode, number> = {
+	linear: 0,
+	srgb: 1,
+}
+
+/** Клик дальше этого сдвига (px) от pointerdown — это вращение орбиты, а не пик. */
+const CLICK_MAX_DRAG_PX = 4
 
 const TONE_MAPPING_MAP: Record<ToneMappingMode, THREE.ToneMapping> = {
 	none: THREE.NoToneMapping,
@@ -41,6 +53,7 @@ interface Settings {
 	textureOn: boolean
 	vertexBlend: VertexBlendMode
 	vertexBlendFactor: number
+	colorDecode: ColorDecodeMode
 	toneMapping: ToneMappingMode
 	exposure: number
 	background: BackgroundMode
@@ -63,7 +76,32 @@ interface MeshEntry {
 	basic: THREE.MeshBasicMaterial
 	standard: THREE.MeshStandardMaterial
 	originalMap: THREE.Texture | null
-	colorAttrs: Record<string, THREE.BufferAttribute>
+	/** Ключ — glTF-имя (COLOR_n). Ссылки на исходные атрибуты: `color` в геометрии перезаписывается при переключении слоя. */
+	colorAttrs: Record<string, { attr: ColorAttribute; threeName: string }>
+}
+
+interface PickedColorAttr {
+	gltfName: string
+	threeName: string
+	arrayType: string
+	normalized: boolean
+	itemSize: number
+	/** [угол треугольника][компонента] — как лежит в буфере (для Uint8/Uint16 — целые). */
+	raw: number[][]
+	/** [угол треугольника][компонента] — после нормализации, то, что получает шейдер до sRGB-декода. */
+	values: number[][]
+}
+
+interface VertexPick {
+	meshName: string
+	faceIndex: number
+	vertexIndices: [number, number, number]
+	bary: [number, number, number]
+	nearestCorner: number
+	hitPoint: THREE.Vector3
+	/** Мировые позиции углов треугольника. */
+	cornerPoints: THREE.Vector3[]
+	attrs: PickedColorAttr[]
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -73,6 +111,7 @@ const DEFAULT_SETTINGS: Settings = {
 	textureOn: false,
 	vertexBlend: 'multiply',
 	vertexBlendFactor: 0.5,
+	colorDecode: 'linear',
 	toneMapping: 'none',
 	exposure: 1,
 	background: 'grey',
@@ -94,11 +133,32 @@ type BlendableMaterial = THREE.MeshBasicMaterial | THREE.MeshStandardMaterial
 function attachVertexBlend(material: BlendableMaterial) {
 	material.userData.vertexBlendMode = VERTEX_BLEND_MODE_ID.multiply
 	material.userData.vertexBlendFactor = 0.5
-	material.customProgramCacheKey = () => 'debug-vertex-blend-v1'
+	material.userData.vertexColorDecode = COLOR_DECODE_ID.linear
+	material.customProgramCacheKey = () => 'debug-vertex-blend-v2'
 	material.onBeforeCompile = (shader) => {
 		shader.uniforms.vertexBlendMode = { value: material.userData.vertexBlendMode }
 		shader.uniforms.vertexBlendFactor = { value: material.userData.vertexBlendFactor }
+		shader.uniforms.vertexColorDecode = { value: material.userData.vertexColorDecode }
 		material.userData.shader = shader
+		// sRGB-декод по вершинам, до интерполяции — эквивалентно тому, как если бы экспортёр сконвертировал данные в linear.
+		shader.vertexShader = shader.vertexShader
+			.replace(
+				'#include <common>',
+				`#include <common>
+uniform int vertexColorDecode;
+`,
+			)
+			.replace(
+				'#include <color_vertex>',
+				`#include <color_vertex>
+#if defined( USE_COLOR )
+	if (vertexColorDecode == 1) {
+		vec3 c = max(vColor.rgb, vec3(0.0));
+		vColor.rgb = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
+	}
+#endif
+`,
+			)
 		shader.fragmentShader = shader.fragmentShader
 			.replace(
 				'#include <color_pars_fragment>',
@@ -134,36 +194,113 @@ vec3 blendVertexRgb(vec3 base, vec3 blend) {
 	}
 }
 
-function applyVertexBlend(material: BlendableMaterial, mode: VertexBlendMode, factor: number) {
+function applyVertexBlend(material: BlendableMaterial, mode: VertexBlendMode, factor: number, decode: ColorDecodeMode) {
 	const modeId = VERTEX_BLEND_MODE_ID[mode]
+	const decodeId = COLOR_DECODE_ID[decode]
 	material.userData.vertexBlendMode = modeId
 	material.userData.vertexBlendFactor = factor
+	material.userData.vertexColorDecode = decodeId
 	const shader = material.userData.shader as {
 		uniforms: {
 			vertexBlendMode: { value: number }
 			vertexBlendFactor: { value: number }
+			vertexColorDecode: { value: number }
 		}
 	} | undefined
 	if (!shader) return
 	shader.uniforms.vertexBlendMode.value = modeId
 	shader.uniforms.vertexBlendFactor.value = factor
+	shader.uniforms.vertexColorDecode.value = decodeId
 }
 
-function collectColorAttrs(geometry: THREE.BufferGeometry): Record<string, { attr: THREE.BufferAttribute; threeName: string }> {
-	const attrs: Record<string, { attr: THREE.BufferAttribute; threeName: string }> = {}
+function collectColorAttrs(geometry: THREE.BufferGeometry): Record<string, { attr: ColorAttribute; threeName: string }> {
+	const attrs: Record<string, { attr: ColorAttribute; threeName: string }> = {}
 	for (const threeName of Object.keys(geometry.attributes)) {
 		const parsed = parseColorAttrName(threeName)
 		if (!parsed) continue
 		attrs[parsed.gltfName] = {
-			attr: geometry.attributes[threeName] as THREE.BufferAttribute,
+			attr: geometry.attributes[threeName],
 			threeName,
 		}
 	}
 	return attrs
 }
 
+const compareGltfNames = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true })
+
+/** Та же формула, что в вершинном шейдере. */
+function srgbToLinear(c: number): number {
+	const x = Math.max(c, 0)
+	return x < 0.04045 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4)
+}
+
+function linearToSrgb(c: number): number {
+	const x = Math.max(c, 0)
+	return x < 0.0031308 ? x * 12.92 : 1.055 * Math.pow(x, 1 / 2.4) - 0.055
+}
+
+const COMPONENT_GETTERS = ['getX', 'getY', 'getZ', 'getW'] as const
+
+/** Значение как его видит шейдер (normalized-атрибуты уже приведены к 0..1). */
+function readComponent(attr: ColorAttribute, index: number, component: number): number {
+	return attr[COMPONENT_GETTERS[component]](index)
+}
+
+/** Значение как лежит в буфере, без нормализации. Учитывает interleaved-буферы (meshopt / gltf-transform). */
+function readRawComponent(attr: ColorAttribute, index: number, component: number): number {
+	if ('isInterleavedBufferAttribute' in attr && attr.isInterleavedBufferAttribute) {
+		return attr.data.array[index * attr.data.stride + attr.offset + component]
+	}
+	return attr.array[index * attr.itemSize + component]
+}
+
+function describeArrayType(attr: ColorAttribute): string {
+	const array = 'isInterleavedBufferAttribute' in attr && attr.isInterleavedBufferAttribute ? attr.data.array : attr.array
+	return array.constructor.name.replace(/Array$/, '')
+}
+
+function buildVertexPick(mesh: Mesh, entry: MeshEntry, face: THREE.Face, faceIndex: number, point: THREE.Vector3): VertexPick {
+	const vertexIndices: [number, number, number] = [face.a, face.b, face.c]
+	const cornerLocal = vertexIndices.map((i) => mesh.getVertexPosition(i, new THREE.Vector3()))
+	const localPoint = mesh.worldToLocal(point.clone())
+	const baryVec = THREE.Triangle.getBarycoord(localPoint, cornerLocal[0], cornerLocal[1], cornerLocal[2], new THREE.Vector3())
+	const bary: [number, number, number] = baryVec ? [baryVec.x, baryVec.y, baryVec.z] : [1 / 3, 1 / 3, 1 / 3]
+	const nearestCorner = bary.indexOf(Math.max(...bary))
+
+	const attrs = Object.entries(entry.colorAttrs)
+		.sort(([a], [b]) => compareGltfNames(a, b))
+		.map(([gltfName, { attr, threeName }]): PickedColorAttr => {
+			const components = [...Array(Math.min(attr.itemSize, 4)).keys()]
+			return {
+				gltfName,
+				threeName,
+				arrayType: describeArrayType(attr),
+				normalized: attr.normalized,
+				itemSize: attr.itemSize,
+				raw: vertexIndices.map((i) => components.map((c) => readRawComponent(attr, i, c))),
+				values: vertexIndices.map((i) => components.map((c) => readComponent(attr, i, c))),
+			}
+		})
+
+	return {
+		meshName: mesh.name || '(без имени)',
+		faceIndex,
+		vertexIndices,
+		bary,
+		nearestCorner,
+		hitPoint: point.clone(),
+		cornerPoints: cornerLocal.map((v) => v.clone().applyMatrix4(mesh.matrixWorld)),
+		attrs,
+	}
+}
+
 /** Подменяет материалы на лету обходом сцены; исходный map сохраняется в MeshEntry для отключения текстуры. */
-function VertexColorModel({ modelUrl, settings, onStats }: { modelUrl: string; settings: Settings; onStats: (stats: SceneStats) => void }) {
+function VertexColorModel({ modelUrl, settings, onStats, onPick }: {
+	modelUrl: string
+	settings: Settings
+	onStats: (stats: SceneStats) => void
+	onPick: (pick: VertexPick) => void
+}) {
 	const { scene } = useGLTF(modelUrl)
 	const clonedScene = useMemo(() => {
 		const clone = scene.clone(true)
@@ -191,10 +328,8 @@ function VertexColorModel({ modelUrl, settings, onStats }: { modelUrl: string; s
 			const positionCount = geometry.attributes.position?.count ?? 0
 			triangleCount += geometry.index ? geometry.index.count / 3 : positionCount / 3
 
-			const collected = collectColorAttrs(geometry)
-			const colorAttrs: Record<string, THREE.BufferAttribute> = {}
-			for (const [gltfName, { attr, threeName }] of Object.entries(collected)) {
-				colorAttrs[gltfName] = attr
+			const colorAttrs = collectColorAttrs(geometry)
+			for (const [gltfName, { threeName }] of Object.entries(colorAttrs)) {
 				const prev = attrMeshCounts.get(gltfName)
 				attrMeshCounts.set(gltfName, { threeName, meshCount: (prev?.meshCount ?? 0) + 1 })
 			}
@@ -220,7 +355,7 @@ function VertexColorModel({ modelUrl, settings, onStats }: { modelUrl: string; s
 			meshCount,
 			triangleCount: Math.round(triangleCount),
 			colorAttributes: [...attrMeshCounts.entries()]
-				.sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+				.sort(([a], [b]) => compareGltfNames(a, b))
 				.map(([gltfName, info]) => ({ gltfName, threeName: info.threeName, meshCount: info.meshCount })),
 		})
 
@@ -234,7 +369,7 @@ function VertexColorModel({ modelUrl, settings, onStats }: { modelUrl: string; s
 
 	useEffect(() => {
 		for (const [mesh, entry] of entriesRef.current) {
-			const source = entry.colorAttrs[settings.colorAttribute]
+			const source = entry.colorAttrs[settings.colorAttribute]?.attr
 			if (source) mesh.geometry.setAttribute('color', source)
 
 			const material = settings.materialMode === 'basic' ? entry.basic : entry.standard
@@ -246,13 +381,50 @@ function VertexColorModel({ modelUrl, settings, onStats }: { modelUrl: string; s
 				material.wireframe = settings.wireframe
 				material.needsUpdate = true
 			}
-			applyVertexBlend(material, settings.vertexBlend, settings.vertexBlendFactor)
+			applyVertexBlend(material, settings.vertexBlend, settings.vertexBlendFactor, settings.colorDecode)
 			mesh.material = material
 		}
-	}, [clonedScene, settings.materialMode, settings.vertexColorsOn, settings.colorAttribute, settings.textureOn, settings.vertexBlend, settings.vertexBlendFactor, settings.wireframe])
+	}, [clonedScene, settings.materialMode, settings.vertexColorsOn, settings.colorAttribute, settings.textureOn, settings.vertexBlend, settings.vertexBlendFactor, settings.colorDecode, settings.wireframe])
+
+	const handleClick = useCallback((e: ThreeEvent<MouseEvent>) => {
+		if (e.delta > CLICK_MAX_DRAG_PX) return
+		const mesh = e.object as Mesh
+		const entry = entriesRef.current.get(mesh)
+		if (!mesh.isMesh || !entry || !e.face) return
+		// Только ближайшее пересечение, остальные меши за ним не интересны.
+		e.stopPropagation()
+		onPick(buildVertexPick(mesh, entry, e.face, e.faceIndex ?? -1, e.point))
+	}, [onPick])
 
 	// Без масштабов и трансформов — это просто вьюер. dispose={null}: геометрии общие с кэшем useGLTF.
-	return <primitive object={clonedScene} dispose={null} />
+	return <primitive object={clonedScene} dispose={null} onClick={handleClick} />
+}
+
+const markerMaterialProps = { depthTest: false, transparent: true, toneMapped: false } as const
+
+/** Треугольник под курсором, выбранная вершина и точка попадания — поверх сцены, без depth test. */
+function PickMarkers({ pick, corner }: { pick: VertexPick; corner: number }) {
+	const triangle = useMemo(() => new THREE.BufferGeometry().setFromPoints(pick.cornerPoints), [pick])
+	const hit = useMemo(() => new THREE.BufferGeometry().setFromPoints([pick.hitPoint]), [pick])
+	const vertex = useMemo(() => new THREE.BufferGeometry().setFromPoints([pick.cornerPoints[corner]]), [pick, corner])
+
+	useEffect(() => () => triangle.dispose(), [triangle])
+	useEffect(() => () => hit.dispose(), [hit])
+	useEffect(() => () => vertex.dispose(), [vertex])
+
+	return (
+		<>
+			<lineLoop geometry={triangle} renderOrder={1000}>
+				<lineBasicMaterial color="#ffd400" {...markerMaterialProps} />
+			</lineLoop>
+			<points geometry={hit} renderOrder={1001}>
+				<pointsMaterial color="#ffffff" size={6} sizeAttenuation={false} {...markerMaterialProps} />
+			</points>
+			<points geometry={vertex} renderOrder={1002}>
+				<pointsMaterial color="#ff2bd6" size={12} sizeAttenuation={false} {...markerMaterialProps} />
+			</points>
+		</>
+	)
 }
 
 function RendererSettings({ toneMapping, exposure, background }: {
@@ -339,13 +511,165 @@ function LoadingFallback() {
 	return <div style={loadingFallbackStyle}>Загрузка модели…</div>
 }
 
+const inspectorStyle: CSSProperties = {
+	...overlayStyle,
+	left: 'auto',
+	right: 12,
+	width: 360,
+}
+
+const valueGridStyle: CSSProperties = {
+	display: 'grid',
+	gridTemplateColumns: '72px repeat(4, 1fr)',
+	columnGap: 6,
+	fontVariantNumeric: 'tabular-nums',
+}
+
+const swatchStyle: CSSProperties = {
+	width: 36,
+	height: 18,
+	borderRadius: 3,
+	border: '1px solid rgba(255,255,255,0.3)',
+	flexShrink: 0,
+}
+
+const COMPONENT_LABELS = ['R', 'G', 'B', 'A']
+
+function toCssColor(rgb: number[]): string {
+	const channel = (v: number) => Math.round(THREE.MathUtils.clamp(v, 0, 1) * 255)
+	return `rgb(${channel(rgb[0] ?? 0)}, ${channel(rgb[1] ?? 0)}, ${channel(rgb[2] ?? 0)})`
+}
+
+function toHex(rgb: number[]): string {
+	return '#' + rgb.slice(0, 3)
+		.map((v) => Math.round(THREE.MathUtils.clamp(v, 0, 1) * 255).toString(16).padStart(2, '0'))
+		.join('')
+}
+
+/** sRGB-декод только для RGB, альфа всегда линейная. */
+function decodeRgb(values: number[]): number[] {
+	return values.map((v, i) => (i < 3 ? srgbToLinear(v) : v))
+}
+
+function ValueRow({ label, values, format, highlight }: {
+	label: string
+	values: number[]
+	format: (v: number) => string
+	highlight?: boolean
+}) {
+	return (
+		<div style={{ ...valueGridStyle, color: highlight ? '#ffd400' : undefined }}>
+			<span style={{ opacity: highlight ? 1 : 0.6 }}>{label}</span>
+			{values.map((v, i) => <span key={i}>{format(v)}</span>)}
+		</div>
+	)
+}
+
+function PickedAttrBlock({ attr, corner, bary, decode, isActive }: {
+	attr: PickedColorAttr
+	corner: number
+	bary: [number, number, number]
+	decode: ColorDecodeMode
+	isActive: boolean
+}) {
+	const isFloat = attr.arrayType.startsWith('Float')
+	const stored = attr.values[corner]
+	const decoded = decodeRgb(stored)
+	const toShader = (values: number[]) => (decode === 'srgb' ? decodeRgb(values) : values)
+	// GPU интерполирует уже декодированный vColor, поэтому сначала декод по углам, потом барицентрика.
+	const shaderAtHit = stored.map((_, c) => attr.values.reduce((sum, cornerValues, k) => sum + toShader(cornerValues)[c] * bary[k], 0))
+	const fmt = (v: number) => v.toFixed(3)
+
+	return (
+		<fieldset style={{ ...fieldsetStyle, borderColor: isActive ? 'rgba(255,212,0,0.6)' : undefined }}>
+			<legend>
+				{attr.gltfName}
+				<span style={{ opacity: 0.55 }}> · {attr.threeName} · {attr.arrayType}{attr.normalized ? ' norm' : ''} · {attr.itemSize === 4 ? 'RGBA' : 'RGB'}</span>
+			</legend>
+			<div style={valueGridStyle}>
+				<span />
+				{stored.map((_, i) => <span key={i} style={{ opacity: 0.6 }}>{COMPONENT_LABELS[i]}</span>)}
+			</div>
+			{!isFloat && <ValueRow label="raw" values={attr.raw[corner]} format={String} />}
+			<ValueRow label={decode === 'linear' ? 'float ◀' : 'float'} values={stored} format={fmt} highlight={decode === 'linear'} />
+			<ValueRow label={decode === 'srgb' ? 'sRGB→lin ◀' : 'sRGB→lin'} values={decoded} format={fmt} highlight={decode === 'srgb'} />
+			<ValueRow label="в точке" values={shaderAtHit} format={fmt} />
+			<div style={{ ...rowStyle, marginTop: 4 }}>
+				<div style={{ ...swatchStyle, background: toCssColor(stored), outline: decode === 'srgb' ? '2px solid #ffd400' : undefined }} />
+				<span style={{ opacity: decode === 'srgb' ? 1 : 0.6 }}>как sRGB {toHex(stored)}</span>
+			</div>
+			<div style={rowStyle}>
+				<div style={{ ...swatchStyle, background: toCssColor(stored.map((v, i) => (i < 3 ? linearToSrgb(v) : v))), outline: decode === 'linear' ? '2px solid #ffd400' : undefined }} />
+				<span style={{ opacity: decode === 'linear' ? 1 : 0.6 }}>как linear</span>
+			</div>
+		</fieldset>
+	)
+}
+
+function VertexInspector({ pick, corner, onCornerChange, decode, activeAttribute, onClose }: {
+	pick: VertexPick
+	corner: number
+	onCornerChange: (corner: number) => void
+	decode: ColorDecodeMode
+	activeAttribute: string
+	onClose: () => void
+}) {
+	const p = pick.hitPoint
+	return (
+		<div style={inspectorStyle}>
+			<div style={{ ...rowStyle, justifyContent: 'space-between' }}>
+				<span style={{ fontWeight: 700, fontSize: 13 }}>Инспектор вершины</span>
+				<button type="button" style={buttonStyle} onClick={onClose}>✕</button>
+			</div>
+			<div style={{ wordBreak: 'break-all' }}>
+				<div>mesh: {pick.meshName}</div>
+				<div>face #{pick.faceIndex} · hit ({p.x.toFixed(3)}, {p.y.toFixed(3)}, {p.z.toFixed(3)})</div>
+			</div>
+			<fieldset style={fieldsetStyle}>
+				<legend>Вершина треугольника (bary)</legend>
+				{pick.vertexIndices.map((vertexIndex, k) => (
+					<label key={k} style={rowStyle}>
+						<input type="radio" name="pickCorner" checked={corner === k} onChange={() => onCornerChange(k)} />
+						#{vertexIndex}
+						<span style={{ opacity: 0.55 }}> · w={pick.bary[k].toFixed(3)}{k === pick.nearestCorner ? ' · ближайшая' : ''}</span>
+					</label>
+				))}
+			</fieldset>
+			{pick.attrs.length > 0 ? (
+				pick.attrs.map((attr) => (
+					<PickedAttrBlock
+						key={attr.gltfName}
+						attr={attr}
+						corner={corner}
+						bary={pick.bary}
+						decode={decode}
+						isActive={attr.gltfName === activeAttribute}
+					/>
+				))
+			) : (
+				<div style={{ opacity: 0.55 }}>у меша нет COLOR_*</div>
+			)}
+			<div style={{ opacity: 0.55 }}>
+				◀ — что уходит в шейдер при текущем декоде. «в точке» — барицентрическая интерполяция в точке клика (после декода).
+			</div>
+		</div>
+	)
+}
+
 export default function DebugVertexColors() {
 	const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
 	const [stats, setStats] = useState<SceneStats | null>(null)
 	const [modelUrl, setModelUrl] = useState(MODEL_PATH)
 	const [localFileName, setLocalFileName] = useState<string | null>(null)
+	const [pick, setPick] = useState<VertexPick | null>(null)
+	const [pickCorner, setPickCorner] = useState(0)
 	const objectUrlRef = useRef<string | null>(null)
 	const fileInputRef = useRef<HTMLInputElement>(null)
+
+	const handlePick = useCallback((p: VertexPick) => {
+		setPick(p)
+		setPickCorner(p.nearestCorner)
+	}, [])
 
 	const handleStats = useCallback((s: SceneStats) => {
 		setStats(s)
@@ -366,6 +690,7 @@ export default function DebugVertexColors() {
 		setModelUrl(url)
 		setLocalFileName(file.name)
 		setStats(null)
+		setPick(null)
 		setSettings((prev) => ({ ...prev, colorAttribute: 'COLOR_0' }))
 	}
 
@@ -378,6 +703,7 @@ export default function DebugVertexColors() {
 		setModelUrl(MODEL_PATH)
 		setLocalFileName(null)
 		setStats(null)
+		setPick(null)
 		setSettings((prev) => ({ ...prev, colorAttribute: 'COLOR_0' }))
 		if (fileInputRef.current) fileInputRef.current.value = ''
 	}
@@ -465,6 +791,33 @@ export default function DebugVertexColors() {
 					) : (
 						<div style={{ opacity: 0.55 }}>нет COLOR_*</div>
 					)}
+				</fieldset>
+
+				<fieldset style={fieldsetStyle}>
+					<legend>Декодирование атрибута</legend>
+					<label style={rowStyle}>
+						<input
+							type="radio"
+							name="colorDecode"
+							checked={settings.colorDecode === 'linear'}
+							onChange={() => update('colorDecode', 'linear')}
+							disabled={!settings.vertexColorsOn}
+						/>
+						Linear — как есть (glTF / Three.js)
+					</label>
+					<label style={rowStyle}>
+						<input
+							type="radio"
+							name="colorDecode"
+							checked={settings.colorDecode === 'srgb'}
+							onChange={() => update('colorDecode', 'srgb')}
+							disabled={!settings.vertexColorsOn}
+						/>
+						sRGB → linear
+					</label>
+					<span style={{ opacity: 0.55 }}>
+						По спеке glTF COLOR_n — linear. Если с sRGB стало «как в Blender/Substance» — цвета запечены в sRGB без конвертации при экспорте: проблема пайплайна, не модели.
+					</span>
 				</fieldset>
 
 				<label style={rowStyle}>
@@ -585,12 +938,24 @@ export default function DebugVertexColors() {
 					) : (
 						<div>Загрузка статистики…</div>
 					)}
+					<div style={{ opacity: 0.55, marginTop: 4 }}>Клик по модели → инспектор вершины</div>
 				</div>
 			</div>
 
+			{pick && (
+				<VertexInspector
+					pick={pick}
+					corner={pickCorner}
+					onCornerChange={setPickCorner}
+					decode={settings.colorDecode}
+					activeAttribute={settings.colorAttribute}
+					onClose={() => setPick(null)}
+				/>
+			)}
+
 			{!stats && <LoadingFallback />}
 
-			<Canvas camera={{ position: [8, 6, 8], fov: 50 }} dpr={[1, 1.5]} gl={{ antialias: true }}>
+			<Canvas camera={{ position: [8, 6, 8], fov: 50 }} dpr={[1, 1.5]} gl={{ antialias: true }} style={{ cursor: 'crosshair' }}>
 				<RendererSettings
 					toneMapping={settings.toneMapping}
 					exposure={settings.exposure}
@@ -598,8 +963,9 @@ export default function DebugVertexColors() {
 				/>
 				{settings.materialMode === 'standard' && <ambientLight intensity={0.3} />}
 				<Suspense fallback={null}>
-					<VertexColorModel key={modelUrl} modelUrl={modelUrl} settings={settings} onStats={handleStats} />
+					<VertexColorModel key={modelUrl} modelUrl={modelUrl} settings={settings} onStats={handleStats} onPick={handlePick} />
 				</Suspense>
+				{pick && <PickMarkers pick={pick} corner={pickCorner} />}
 				<OrbitControls makeDefault />
 			</Canvas>
 		</div>

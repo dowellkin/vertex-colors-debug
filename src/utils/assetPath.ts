@@ -1,14 +1,14 @@
 /**
  * Prepends Vite's base URL to a public asset path.
  *
- * Dev, page served by Vite (localhost:5174 or a tunnel like *.lhr.life):
+ * Dev, page served by Vite (localhost:5175 or a tunnel like *.lhr.life):
  *   relative "/" so GLBs follow the same host as the page.
  * Dev, game embedded in Laravel on another origin:
- *   VITE_DEV_ORIGIN (http://localhost:5174) so assets still hit Vite.
+ *   VITE_DEV_ORIGIN (http://localhost:5175) so assets still hit Vite.
  * Production: BASE_URL is "/assets/onboarding-game/" — served from Laravel.
  */
 function resolveDevBase(): string {
-	const configured = String(import.meta.env.VITE_DEV_ORIGIN ?? 'http://localhost:5174').replace(/\/$/, '')
+	const configured = String(import.meta.env.VITE_DEV_ORIGIN ?? 'http://localhost:5175').replace(/\/$/, '')
 	if (typeof window === 'undefined') return `${configured}/`
 
 	const viteOrigin = (() => {
@@ -21,7 +21,7 @@ function resolveDevBase(): string {
 
 	const { origin, hostname, port } = window.location
 	const onViteOrigin = origin === viteOrigin
-	const onVitePort = port === (new URL(viteOrigin).port || '5174')
+	const onVitePort = port === (new URL(viteOrigin).port || '5175')
 	const viaTunnel = hostname !== 'localhost' && hostname !== '127.0.0.1'
 
 	if (onViteOrigin || onVitePort || viaTunnel) return '/'
